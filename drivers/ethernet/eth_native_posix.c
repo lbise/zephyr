@@ -46,6 +46,7 @@ LOG_MODULE_REGISTER(LOG_MODULE_NAME);
 #endif
 
 struct eth_context {
+	u8_t id;
 	u8_t recv[NET_ETH_MTU + ETH_HDR_LEN];
 	u8_t send[NET_ETH_MTU + ETH_HDR_LEN];
 	u8_t mac_addr[6];
@@ -63,13 +64,19 @@ struct eth_context {
 #if defined(CONFIG_ETH_NATIVE_POSIX_PTP_CLOCK)
 	struct device *ptp_clock;
 #endif
+	K_THREAD_STACK_MEMBER(eth_rx_stack, CONFIG_ARCH_POSIX_RECOMMENDED_STACK_SIZE);
+	struct k_thread rx_thread_data;
 };
 
-K_THREAD_STACK_DEFINE(eth_rx_stack, CONFIG_ARCH_POSIX_RECOMMENDED_STACK_SIZE);
-static struct k_thread rx_thread_data;
+static struct eth_context eth_context_data = {
+	.id = 0,
+};
 
-/* TODO: support multiple interfaces */
-static struct eth_context eth_context_data;
+#if defined(CONFIG_ETH_NATIVE_POSIX_SECOND_IFACE)
+static struct eth_context eth_context_data_2 = {
+	.id = 1,
+};
+#endif
 
 #if defined(CONFIG_NET_GPTP)
 static bool need_timestamping(struct gptp_hdr *hdr)
@@ -384,12 +391,12 @@ static void eth_rx(struct eth_context *ctx)
 
 static void create_rx_handler(struct eth_context *ctx)
 {
-	k_thread_create(&rx_thread_data, eth_rx_stack,
-			K_THREAD_STACK_SIZEOF(eth_rx_stack),
+	k_thread_create(&ctx->rx_thread_data, ctx->eth_rx_stack,
+			K_THREAD_STACK_SIZEOF(ctx->eth_rx_stack),
 			(k_thread_entry_t)eth_rx,
 			ctx, NULL, NULL, K_PRIO_COOP(14),
 			0, K_NO_WAIT);
-	k_thread_name_set(&rx_thread_data, "eth_native_posix_rx");
+	k_thread_name_set(&ctx->rx_thread_data, "eth_native_posix_rx");
 }
 
 static void eth_iface_init(struct net_if *iface)
@@ -428,11 +435,18 @@ static void eth_iface_init(struct net_if *iface)
 		ctx->mac_addr[5] = 0x01;
 	}
 #else
-	if (CONFIG_ETH_NATIVE_POSIX_MAC_ADDR[0] != 0) {
+	static char *mac_addr = NULL;
+	if (ctx->id == 0) {
+		mac_addr = CONFIG_ETH_NATIVE_POSIX_MAC_ADDR;
+	} else if (ctx->id == 1) {
+		mac_addr = CONFIG_ETH_NATIVE_POSIX_MAC_ADDR_2;
+	}
+
+	if (mac_addr[0] != 0) {
 		if (net_bytes_from_str(ctx->mac_addr, sizeof(ctx->mac_addr),
-				       CONFIG_ETH_NATIVE_POSIX_MAC_ADDR) < 0) {
+				       mac_addr) < 0) {
 			LOG_ERR("Invalid MAC address %s",
-				CONFIG_ETH_NATIVE_POSIX_MAC_ADDR);
+				mac_addr);
 		}
 	}
 #endif
@@ -440,7 +454,11 @@ static void eth_iface_init(struct net_if *iface)
 	net_if_set_link_addr(iface, ll_addr->addr, ll_addr->len,
 			     NET_LINK_ETHERNET);
 
-	ctx->if_name = ETH_NATIVE_POSIX_DRV_NAME;
+	if (ctx->id == 0) {
+		ctx->if_name = ETH_NATIVE_POSIX_DRV_NAME;
+	} else if (ctx->id == 1) {
+		ctx->if_name = ETH_NATIVE_POSIX_DRV_NAME_2;
+	}
 
 	ctx->dev_fd = eth_iface_create(ctx->if_name, false);
 	if (ctx->dev_fd < 0) {
@@ -582,10 +600,25 @@ static const struct ethernet_api eth_if_api = {
 #endif
 };
 
+//#define NATIVE_POSIX_ETH_INIT(idx)
+//static struct eth_context eth_context_data_##idx = {
+//	.id = idx;
+//};
+
 ETH_NET_DEVICE_INIT(eth_native_posix, ETH_NATIVE_POSIX_DRV_NAME,
 		    eth_init, device_pm_control_nop, &eth_context_data, NULL,
 		    CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &eth_if_api,
 		    NET_ETH_MTU);
+
+#if defined(CONFIG_ETH_NATIVE_POSIX_SECOND_IFACE)
+
+/* TODO PTP? */
+ETH_NET_DEVICE_INIT(eth_native_posix_2, CONFIG_ETH_NATIVE_POSIX_DRV_NAME_2,
+		    eth_init, device_pm_control_nop, &eth_context_data_2, NULL,
+		    CONFIG_KERNEL_INIT_PRIORITY_DEFAULT, &eth_if_api,
+		    NET_ETH_MTU);
+
+#endif /* ETH_NATIVE_POSIX_SECOND_IFACE */
 
 #if defined(CONFIG_ETH_NATIVE_POSIX_PTP_CLOCK)
 struct ptp_context {

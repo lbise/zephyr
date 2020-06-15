@@ -13,6 +13,7 @@ LOG_MODULE_DECLARE(net_echo_server_sample, LOG_LEVEL_DBG);
 #include <zephyr.h>
 #include <errno.h>
 #include <stdio.h>
+#include <fcntl.h>
 
 #include <net/socket.h>
 #include <net/tls_credentials.h>
@@ -38,6 +39,13 @@ static k_tid_t tcp6_handler_tid[CONFIG_NET_SAMPLE_NUM_HANDLERS];
 static bool tcp6_handler_in_use[CONFIG_NET_SAMPLE_NUM_HANDLERS];
 #endif
 
+#if defined(CONFIG_NET_SAMPLE_ASYNC_SOCKETS_POLL)
+#define NUM_FDS (MAX_CLIENT_QUEUE + 2)
+struct pollfd pollfds[NUM_FDS];
+int pollnum;
+#endif
+
+#if defined(CONFIG_NET_SAMPLE_SYNC_SOCKETS)
 static void process_tcp4(void);
 static void process_tcp6(void);
 
@@ -48,6 +56,72 @@ K_THREAD_DEFINE(tcp4_thread_id, STACK_SIZE,
 K_THREAD_DEFINE(tcp6_thread_id, STACK_SIZE,
 		process_tcp6, NULL, NULL, NULL,
 		THREAD_PRIORITY, 0, -1);
+#elif defined(CONFIG_NET_SAMPLE_ASYNC_SOCKETS_POLL)
+static void process_async(void);
+
+K_THREAD_DEFINE(async_thread_id, STACK_SIZE,
+		process_async, NULL, NULL, NULL,
+		THREAD_PRIORITY, 0, -1);
+#endif
+
+#if defined(CONFIG_NET_SAMPLE_ASYNC_SOCKETS_POLL)
+static int setblocking(int fd, bool val)
+{
+	int fl, res;
+
+	fl = fcntl(fd, F_GETFL, 0);
+	if (fl == -1) {
+		LOG_ERR("fcntl(F_GETFL): %d", errno);
+		return -1;
+	}
+
+	if (val) {
+		fl &= ~O_NONBLOCK;
+	} else {
+		fl |= O_NONBLOCK;
+	}
+
+	res = fcntl(fd, F_SETFL, fl);
+	if (fl == -1) {
+		LOG_ERR("fcntl(F_SETFL): %d", errno);
+		return -1;
+	}
+
+	return 0;
+}
+
+int pollfds_add(int fd)
+{
+	int i;
+	if (pollnum < NUM_FDS) {
+		i = pollnum++;
+	} else {
+		for (i = 0; i < NUM_FDS; i++) {
+			if (pollfds[i].fd < 0) {
+				goto found;
+			}
+		}
+
+		return -1;
+	}
+
+found:
+	pollfds[i].fd = fd;
+	pollfds[i].events = POLLIN;
+
+	return 0;
+}
+
+void pollfds_del(int fd)
+{
+	for (int i = 0; i < pollnum; i++) {
+		if (pollfds[i].fd == fd) {
+			pollfds[i].fd = -1;
+			break;
+		}
+	}
+}
+#endif
 
 static ssize_t sendall(int sock, const void *buf, size_t len)
 {
@@ -114,76 +188,97 @@ static int start_tcp_proto(struct data *data,
 		ret = -errno;
 	}
 
+#if defined(CONFIG_NET_SAMPLE_ASYNC_SOCKETS_POLL)
+	ret = setblocking(data->tcp.sock, true);
+	if (ret < 0) {
+		LOG_ERR("Failed to set TCP socket as non-blocking (%d)", ret);
+		ret = -errno;
+	}
+
+	ret = pollfds_add(data->tcp.sock);
+	if (ret < 0) {
+		LOG_ERR("Cannot add TCP socket to FD list");
+		ret = -ENOMEM;
+	}
+#endif
+
+	LOG_INF("Waiting for TCP connection on port %d (%s)...",
+		MY_PORT, data->proto);
+
 	return ret;
 }
 
-static void handle_data(void *ptr1, void *ptr2, void *ptr3)
+static int handle_data(int sock, char *buff, size_t size, int *offset)
+{
+	int received;
+
+	received = recv(sock, buff, size, 0);
+	if (received == 0) {
+		/* Connection closed */
+		LOG_INF("TCP (%s): Connection closed", data->proto);
+		return 0;
+	} else if (received < 0) {
+		/* Socket error */
+		LOG_ERR("TCP (%s): Connection error %d", data->proto,
+			errno);
+		return -errno;
+	}
+
+	offset += received;
+
+#if !defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS)
+	/* To prevent fragmentation of the response, reply only if
+	 * buffer is full or there is no more data to read
+	 */
+	if (offset == size ||
+	    (recv(client, buff + offset, size - offset,
+		  MSG_PEEK | MSG_DONTWAIT) < 0 &&
+	     (errno == EAGAIN || errno == EWOULDBLOCK))) {
+#endif
+		ret = sendall(client, buff, offset);
+		if (ret < 0) {
+			LOG_ERR("TCP (%s): Failed to send, "
+				"closing socket", data->proto);
+			return 0;
+		}
+
+		LOG_DBG("TCP (%s): Received and replied with %d bytes",
+			data->proto, offset);
+
+		if (++data->tcp.accepted[slot].counter % 1000 == 0U) {
+			LOG_INF("%s TCP: Sent %u packets", data->proto,
+				data->tcp.accepted[slot].counter);
+		}
+
+		offset = 0;
+#if !defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS)
+	}
+#endif
+
+	return 0;
+}
+
+static void handle_data_thread(void *ptr1, void *ptr2, void *ptr3)
 {
 	int slot = POINTER_TO_INT(ptr1);
 	struct data *data = ptr2;
 	bool *in_use = ptr3;
+	char *buff;
 	int offset = 0;
-	int received;
 	int client;
 	int ret;
 
 	client = data->tcp.accepted[slot].sock;
 
 	do {
-		received = recv(client,
-			data->tcp.accepted[slot].recv_buffer + offset,
-			sizeof(data->tcp.accepted[slot].recv_buffer) - offset,
-			0);
-
-		if (received == 0) {
-			/* Connection closed */
-			LOG_INF("TCP (%s): Connection closed", data->proto);
-			ret = 0;
-			break;
-		} else if (received < 0) {
-			/* Socket error */
-			LOG_ERR("TCP (%s): Connection error %d", data->proto,
-				errno);
-			ret = -errno;
+		buff = data->tcp.accepted[slot].recv_buffer + offset;
+		ret = handle_data(client, buff,
+				  sizeof(data->tcp.accepted[slot].recv_buffer),
+				  &offset);
+		if (ret < 0) {
+			LOG_ERR("Cannot handle data %d", ret);
 			break;
 		}
-
-		offset += received;
-
-#if !defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS)
-		/* To prevent fragmentation of the response, reply only if
-		 * buffer is full or there is no more data to read
-		 */
-		if (offset == sizeof(data->tcp.accepted[slot].recv_buffer) ||
-		    (recv(client,
-			  data->tcp.accepted[slot].recv_buffer + offset,
-			  sizeof(data->tcp.accepted[slot].recv_buffer) -
-								offset,
-			  MSG_PEEK | MSG_DONTWAIT) < 0 &&
-		     (errno == EAGAIN || errno == EWOULDBLOCK))) {
-#endif
-			ret = sendall(client,
-				      data->tcp.accepted[slot].recv_buffer,
-				      offset);
-			if (ret < 0) {
-				LOG_ERR("TCP (%s): Failed to send, "
-					"closing socket", data->proto);
-				ret = 0;
-				break;
-			}
-
-			LOG_DBG("TCP (%s): Received and replied with %d bytes",
-				data->proto, offset);
-
-			if (++data->tcp.accepted[slot].counter % 1000 == 0U) {
-				LOG_INF("%s TCP: Sent %u packets", data->proto,
-					data->tcp.accepted[slot].counter);
-			}
-
-			offset = 0;
-#if !defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS)
-		}
-#endif
 	} while (true);
 
 	*in_use = false;
@@ -213,9 +308,6 @@ static int process_tcp(struct data *data)
 	struct sockaddr_in client_addr;
 	socklen_t client_addr_len = sizeof(client_addr);
 
-	LOG_INF("Waiting for TCP connection on port %d (%s)...",
-		MY_PORT, data->proto);
-
 	client = accept(data->tcp.sock, (struct sockaddr *)&client_addr,
 			&client_addr_len);
 	if (client < 0) {
@@ -234,6 +326,7 @@ static int process_tcp(struct data *data)
 
 	LOG_INF("TCP (%s): Accepted connection", data->proto);
 
+#if defined(CONFIG_NET_SAMPLE_SYNC_SOCKETS)
 #if defined(CONFIG_NET_IPV6)
 	if (client_addr.sin_family == AF_INET6) {
 		tcp6_handler_in_use[slot] = true;
@@ -264,9 +357,86 @@ static int process_tcp(struct data *data)
 	}
 #endif
 
-	return 0;
+#endif
+
+	return slot;
 }
 
+#if defined(CONFIG_NET_SAMPLE_ASYNC_SOCKETS_POLL)
+static void process_async(void)
+{
+	int ret = 0;
+	struct sockaddr_in addr4;
+	struct sockaddr_in6 addr6;
+	int num_servs = 0;
+	struct sockaddr_storage client_addr;
+	socklen_t client_addr_len = sizeof(client_addr);
+
+	if (IS_ENABLED(CONFIG_NET_IPV4)) {
+		(void)memset(&addr4, 0, sizeof(addr4));
+		addr4.sin_family = AF_INET;
+		addr4.sin_port = htons(MY_PORT);
+
+		ret = start_tcp_proto(&conf.ipv4, (struct sockaddr *)&addr4,
+				      sizeof(addr4));
+		if (ret < 0) {
+			quit();
+			return;
+		}
+
+		num_servs++;
+	}
+
+	if (IS_ENABLED(CONFIG_NET_IPV6)) {
+		(void)memset(&addr6, 0, sizeof(addr6));
+		addr6.sin6_family = AF_INET6;
+		addr6.sin6_port = htons(MY_PORT);
+
+		ret = start_tcp_proto(&conf.ipv6, (struct sockaddr *)&addr6,
+				      sizeof(addr6));
+
+		num_servs++;
+	}
+
+	while (ret == 0) {
+		ret = poll(pollfds, pollnum, -1);
+		if (ret == -1) {
+			LOG_ERR("poll error: %d", errno);
+			break;
+		}
+
+		for (int i = 0; i < pollnum; i++) {
+			if (!(pollfds[i].revents & POLLIN)) {
+				continue;
+			}
+
+			int fd = pollfds[i].fd;
+			if (i < num_servs) {
+				int client = accept(fd, (struct sockaddr *)&client_addr,
+						    &client_addr_len);
+				if (client < 0) {
+					LOG_ERR("Cannot accept client %d", errno);
+					continue;
+				}
+
+				if (pollfds_add(client) < 0) {
+					LOG_WRN("Too many clients connected");
+					close(client);
+				} else {
+					setblocking(client, false);
+				}
+			} else {
+
+
+
+
+			}
+		}
+	}
+}
+#endif
+
+#if defined(CONFIG_NET_SAMPLE_SYNC_SOCKETS)
 static void process_tcp4(void)
 {
 	int ret;
@@ -318,11 +488,13 @@ static void process_tcp6(void)
 
 	quit();
 }
+#endif
 
 void start_tcp(void)
 {
 	int i;
 
+#if defined(CONFIG_NET_SAMPLE_SYNC_SOCKETS)
 	for (i = 0; i < CONFIG_NET_SAMPLE_NUM_HANDLERS; i++) {
 		conf.ipv6.tcp.accepted[i].sock = -1;
 		conf.ipv4.tcp.accepted[i].sock = -1;
@@ -342,6 +514,9 @@ void start_tcp(void)
 	if (IS_ENABLED(CONFIG_NET_IPV4)) {
 		k_thread_start(tcp4_thread_id);
 	}
+#else
+	k_thread_start(async_thread_id);
+#endif
 }
 
 void stop_tcp(void)
@@ -352,6 +527,7 @@ void stop_tcp(void)
 	 * in accept or recv call it seems to be necessary
 	 */
 
+#if defined(CONFIG_NET_SAMPLE_SYNC_SOCKETS)
 	if (IS_ENABLED(CONFIG_NET_IPV6)) {
 		k_thread_abort(tcp6_thread_id);
 		if (conf.ipv6.tcp.sock >= 0) {
@@ -387,4 +563,7 @@ void stop_tcp(void)
 			}
 		}
 	}
+#else
+	k_thread_abort(async_thread_id);
+#endif
 }

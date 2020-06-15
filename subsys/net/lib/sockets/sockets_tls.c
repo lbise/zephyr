@@ -1200,6 +1200,7 @@ int ztls_close_ctx(struct net_context *ctx)
 		(void)mbedtls_ssl_close_notify(&ctx->tls->ssl);
 
 		err = tls_release(ctx->tls);
+		ctx->tls = NULL;
 	} else {
 		err = -EBADF;
 	}

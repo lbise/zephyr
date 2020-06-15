@@ -1645,7 +1645,7 @@ static int cmd_net_dns_query(const struct shell *shell, size_t argc,
 {
 
 #if defined(CONFIG_DNS_RESOLVER)
-#define DNS_TIMEOUT (MSEC_PER_SEC * 2) /* ms */
+#define DNS_TIMEOUT (MSEC_PER_SEC * 30) /* ms */
 	enum dns_query_type qtype = DNS_QUERY_TYPE_A;
 	char *host, *type = NULL;
 	int ret, arg = 1;
@@ -3837,6 +3837,111 @@ static int cmd_net_tcp_close(const struct shell *shell, size_t argc,
 	return 0;
 }
 
+static void tcp_accept_cb(struct net_context *new_context,
+				    struct sockaddr *addr,
+				    socklen_t addrlen,
+				    int status,
+				    void *user_data)
+{
+	const struct shell *shell = (const struct shell *)user_data;
+
+	PR("Client connected %p", new_context);
+
+
+}
+
+static int cmd_net_tcp_listen(const struct shell *shell, size_t argc,
+			      char *argv[])
+{
+#if defined(CONFIG_NET_TCP1) && defined(CONFIG_NET_NATIVE_TCP)
+	int ret;
+	int arg = 0;
+
+	/* tcp listen ip port */
+	char *endptr;
+	char *ip;
+	struct sockaddr addr = { 0 };
+	int addrlen;
+	uint16_t port;
+
+	if (tcp_ctx && net_context_is_used(tcp_ctx)) {
+		PR("Already connected\n");
+		return -ENOEXEC;
+	}
+
+	if (!argv[++arg]) {
+		PR_WARNING("Peer IP address missing.\n");
+		return -ENOEXEC;
+	}
+
+	ip = argv[arg];
+
+	if (!net_ipaddr_parse(ip, strnlen(ip, NET_IPV6_ADDR_LEN), &addr)) {
+		PR_WARNING("Invalid IP address %s\n", ip);
+		return -ENOEXEC;
+	}
+
+	if (!argv[++arg]) {
+		PR_WARNING("Peer port missing.\n");
+		return -ENOEXEC;
+	}
+
+	port = strtol(argv[arg], &endptr, 10);
+	if (*endptr != '\0') {
+		PR_WARNING("Invalid port %s\n", argv[arg]);
+		return -ENOEXEC;
+	}
+
+	if (!IS_ENABLED(CONFIG_NET_IPV4) && addr.sa_family == AF_INET) {
+		PR_WARNING("IPv4 support is not enabled\n");
+		return -ENOEXEC;
+	} else if (!IS_ENABLED(CONFIG_NET_IPV6) && addr.sa_family == AF_INET6) {
+		PR_WARNING("IPv6 support is not enabled\n");
+		return -ENOEXEC;
+	}
+
+	if (addr.sa_family == AF_INET) {
+		net_sin(&addr)->sin_port = htons(port);
+		addrlen = sizeof(struct sockaddr_in);
+	} else if (addr.sa_family == AF_INET6) {
+		net_sin6(&addr)->sin6_port = htons(port);
+		addrlen = sizeof(struct sockaddr_in6);
+	}
+
+	ret = net_context_get(addr.sa_family, SOCK_STREAM, IPPROTO_TCP,
+			      &tcp_ctx);
+	if (ret < 0) {
+		PR_WARNING("Cannot get TCP context (%d)\n", ret);
+		return -ENOEXEC;
+	}
+
+	ret = net_context_bind(tcp_ctx, &addr, sizeof(addr));
+	if (ret < 0) {
+		PR_WARNING("Cannot bind TCP (%d)\n", ret);
+		return -ENOEXEC;
+	}
+
+	ret = net_context_listen(tcp_ctx, 1);
+	if (ret < 0) {
+		PR_WARNING("Cannot listen TCP (%d)\n", ret);
+		return -ENOEXEC;
+	}
+
+	ret = net_context_accept(tcp_ctx, tcp_accept_cb, K_NO_WAIT,
+				 (void *)shell);
+	if (ret < 0) {
+		PR_WARNING("Cannot add accept TCP callback (%d)\n", ret);
+		return -ENOEXEC;
+	}
+
+#else
+	PR_INFO("Set %s to enable %s support.\n",
+		"CONFIG_NET_TCP and CONFIG_NET_NATIVE", "TCP");
+#endif /* CONFIG_NET_TCP */
+
+	return 0;
+}
+
 static int cmd_net_tcp(const struct shell *shell, size_t argc, char *argv[])
 {
 	ARG_UNUSED(argc);
@@ -4453,6 +4558,9 @@ SHELL_STATIC_SUBCMD_SET_CREATE(net_cmd_tcp,
 		  cmd_net_tcp_send),
 	SHELL_CMD(close, NULL,
 		  "'net tcp close' closes TCP connection.", cmd_net_tcp_close),
+	SHELL_CMD(listen, NULL,
+		  "'net tcp listen <address> <port>' listens to TCP peer.",
+		  cmd_net_tcp_listen),
 	SHELL_SUBCMD_SET_END
 );
 

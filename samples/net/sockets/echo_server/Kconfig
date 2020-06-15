@@ -65,4 +65,21 @@ config NET_SAMPLE_CERTS_WITH_SC
 	  Enable this flag, if you are interested to run this
 	  application with signed certificates and keys.
 
+choice
+	prompt "Socket mode"
+	default NET_SAMPLE_SYNC_SOCKETS
+
+config NET_SAMPLE_SYNC_SOCKETS
+	bool "Synchronized sockets"
+	help
+	  Use synchronized sockets (i.e. regular sockets)
+
+config NET_SAMPLE_ASYNC_SOCKETS_POLL
+	bool "Async sockets"
+	help
+	  Enable this flag, if you want the sample to use asynch sockets using
+	  poll
+
+endchoice
+
 source "Kconfig.zephyr"

@@ -242,7 +242,7 @@ config NET_ROUTE
 # Temporarily hide the routing option as we do not have RPL in the system
 # that used to populate the routing table.
 config NET_ROUTING
-	bool
+	bool "IP routing between interfaces"
 	depends on NET_ROUTE
 	help
 	  Allow IPv6 routing between different network interfaces and

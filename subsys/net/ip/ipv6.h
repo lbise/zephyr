@@ -135,6 +135,12 @@ int net_ipv6_send_na(struct net_if *iface, const struct in6_addr *src,
 		     const struct in6_addr *dst, const struct in6_addr *tgt,
 		     u8_t flags);
 
+int net_ipv6_send_ra(struct net_if *iface,
+		     struct in6_addr *rio_addr,
+		     int rio_prefixlen,
+		     struct in6_addr *network_prefix,
+		     int network_len,
+		     u16_t lifetime);
 
 static inline bool net_ipv6_is_nexthdr_upper_layer(u8_t nexthdr)
 {

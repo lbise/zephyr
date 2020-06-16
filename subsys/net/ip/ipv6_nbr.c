@@ -1950,6 +1950,215 @@ drop:
 }
 #endif /* CONFIG_NET_IPV6_NBR_CACHE */
 
+#if defined(CONFIG_NET_ROUTING)
+static inline int set_nd_opt_prefix(struct net_pkt *pkt,
+				    struct in6_addr *network_prefix,
+				    int prefix_len)
+{
+	NET_PKT_DATA_ACCESS_CONTIGUOUS_DEFINE(prefix_access,
+					      struct net_icmpv6_nd_opt_prefix_info);
+	struct net_icmpv6_nd_opt_prefix_info *prefix_info;
+	struct net_icmpv6_nd_opt_hdr opt_hdr = {
+		.type = NET_ICMPV6_ND_OPT_PREFIX_INFO,
+		.len = 4,
+	};
+	int err;
+
+	err = net_pkt_write(pkt, &opt_hdr,
+				sizeof(struct net_icmpv6_nd_opt_hdr));
+	if (err) {
+		return err;;
+	}
+
+	prefix_info = (struct net_icmpv6_nd_opt_prefix_info *)net_pkt_get_data(pkt, &prefix_access);
+	if (!prefix_info) {
+		return -ENOBUFS;
+	}
+
+	/* Let's make sure reserved part is full of 0 */
+	memset(prefix_info, 0, sizeof(struct net_icmpv6_nd_opt_prefix_info));
+
+	prefix_info->prefix_len = prefix_len;
+	prefix_info->flags = 1 << 6;			/* Autonomous: can be used by SLAAC */
+	prefix_info->valid_lifetime = 0xFFFFFFFF;	/* Prefix has Infinite lifetime */
+	prefix_info->preferred_lifetime = 0xFFFFFFFF;	/* Derived address has Infinite lifetime */
+	net_ipaddr_copy(&prefix_info->prefix, network_prefix);
+
+	return net_pkt_set_data(pkt, &prefix_access);
+}
+
+static inline int get_nd_opt_route_len(int prefix_len)
+{
+	/* RFC 4191 - 2.3 Route Information Option
+	 * Length 8-bit unsigned integer. The length of the option
+	 * (including the Type and Length fields) in units of 8
+	 * octets.  The Length field is 1, 2, or 3 depending on the
+	 * Prefix Length. If Prefix Length is greater than 64, then
+	 * Length must be 3. If Prefix Length is greater than 0,
+	 * then Length must be 2 or 3.  If Prefix Length is zero,
+	 * then Length must be 1, 2, or 3.
+	 */
+	if (prefix_len > 64) {
+		/* Full prefix (16 bytes) */
+		return 3;
+	} else if (prefix_len > 0) {
+		/* Half prefix (8 bytes) */
+		return 2;
+	} else {
+		/* No prefix */
+		return 1;
+	}
+}
+
+static inline int set_nd_opt_route(struct net_pkt *pkt,
+				   struct in6_addr *prefix,
+				   int prefix_len)
+{
+	struct net_icmpv6_nd_opt_route route;
+	struct net_icmpv6_nd_opt_hdr opt_hdr = {
+		.type = NET_ICMPV6_ND_OPT_ROUTE,
+	};
+	int err;
+
+	opt_hdr.len = get_nd_opt_route_len(prefix_len);
+
+	err = net_pkt_write(pkt, &opt_hdr,
+				sizeof(struct net_icmpv6_nd_opt_hdr));
+	if (err) {
+		return err;
+	}
+
+	/* Let's make sure reserved part is full of 0 */
+	memset(&route, 0, sizeof(struct net_icmpv6_nd_opt_route));
+
+	route.prefix_len = prefix_len;
+	route.flags = 0;			/* Medium route preference */
+	route.route_lifetime = 0xFFFFFFFF;	/* Infinite lifetime */
+	net_ipaddr_copy(&route.prefix, prefix);
+
+	/* Only add the relevant part of the address (0, 8 or 16 bytes) */
+	return net_pkt_write(pkt, &route, 8 * opt_hdr.len - sizeof(opt_hdr));
+}
+
+int net_ipv6_send_ra(struct net_if *iface,
+		     struct in6_addr *rio_addr,
+		     int rio_prefixlen,
+		     struct in6_addr *network_prefix,
+		     int network_len,
+		     u16_t lifetime)
+{
+	NET_PKT_DATA_ACCESS_CONTIGUOUS_DEFINE(ra_access,
+					      struct net_icmpv6_ra_hdr);
+	int ret = -ENOBUFS;
+	struct net_icmpv6_ra_hdr *ra_hdr;
+	const struct in6_addr *src;
+	struct in6_addr dst;
+	struct net_pkt *pkt;
+	int nd_opt_route_len = 0;
+	u8_t nd6_len;
+	u8_t llao_len;
+
+	net_ipv6_addr_create_ll_allnodes_mcast(&dst);
+	src = net_if_ipv6_select_src_addr(iface, &dst);
+
+	llao_len = get_llao_len(iface);
+
+	nd6_len = sizeof(struct net_icmpv6_ra_hdr) + llao_len;
+
+	if (network_prefix && network_len > 0) {
+		nd6_len += sizeof(struct net_icmpv6_nd_opt_hdr) + sizeof(struct net_icmpv6_nd_opt_prefix_info);
+	}
+
+	/* ND_OPT_ROUTE length in number of 8 bytes */
+	if (rio_addr) {
+		nd_opt_route_len = get_nd_opt_route_len(rio_prefixlen);
+		nd6_len += 8 * nd_opt_route_len;
+	}
+
+	pkt = net_pkt_alloc_with_buffer(iface,
+					nd6_len,
+					AF_INET6, IPPROTO_ICMPV6,
+					ND_NET_BUF_TIMEOUT);
+	if (!pkt) {
+		return -ENOMEM;
+	}
+
+	net_pkt_set_ipv6_hop_limit(pkt, NET_IPV6_ND_HOP_LIMIT);
+
+	if (net_ipv6_create(pkt, src, &dst) ||
+	    net_icmpv6_create(pkt, NET_ICMPV6_RA, 0)) {
+		goto drop;
+	}
+
+	ra_hdr = (struct net_icmpv6_ra_hdr *)net_pkt_get_data(pkt,
+							      &ra_access);
+	if (!ra_hdr) {
+		goto drop;
+	}
+
+	/* Let's make sure reserved part is full of 0 */
+	memset(ra_hdr, 0, sizeof(struct net_icmpv6_ra_hdr));
+
+	ra_hdr->cur_hop_limit = 64;	/* Default TTL of pkt send to this router */
+	ra_hdr->flags = 0;		/* No DHCPv6 at all */
+	ra_hdr->router_lifetime = lifetime;	/* lifetime != 0: Default router for <lifetime> seconds;
+						 * else: will only route the given prefix
+						 */
+	ra_hdr->reachable_time = 60000;	/* Default reachability timer of the nodes (in ms) */
+	ra_hdr->retrans_timer = 0;	/* Retransmission timer between NS unspecified */
+
+	if (net_pkt_set_data(pkt, &ra_access)) {
+		goto drop;
+	}
+
+	/* Add ND_OPT_PREFIX_INFO */
+	if (network_prefix && network_len > 0) {
+		/* Add Prefix Information for SLAAC */
+		if (set_nd_opt_prefix(pkt, network_prefix, network_len)) {
+			goto drop;
+		}
+	}
+
+	/*
+	 * We need to add the SLLAO option *BEFORE* the OPT_ROUTE otherwise the nbr is not known to zephyr and
+	 * it will not add the route
+	 */
+	if (llao_len > 0) {
+		if (!set_llao(pkt, net_if_get_link_addr(iface),
+			      llao_len, NET_ICMPV6_ND_OPT_SLLAO)) {
+			goto drop;
+		}
+	}
+
+	if (rio_addr) {
+		if (set_nd_opt_route(pkt, rio_addr, rio_prefixlen)) {
+			goto drop;
+		}
+	}
+
+	net_pkt_cursor_init(pkt);
+	net_ipv6_finalize(pkt, IPPROTO_ICMPV6);
+
+	dbg_addr_sent("Router Advertisment", src, &dst, pkt);
+
+	if (net_send_data(pkt) < 0) {
+		net_stats_update_ipv6_nd_drop(iface);
+		ret = -EINVAL;
+
+		goto drop;
+	}
+
+	net_stats_update_ipv6_nd_sent(iface);
+
+	return 0;
+
+drop:
+	net_pkt_unref(pkt);
+
+	return ret;
+}
+#endif /* CONFING_NET_ROUTING */
+
 #if defined(CONFIG_NET_IPV6_ND)
 int net_ipv6_send_rs(struct net_if *iface)
 {

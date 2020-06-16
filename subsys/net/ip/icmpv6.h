@@ -61,6 +61,13 @@ struct net_icmpv6_nd_opt_prefix_info {
 	struct in6_addr prefix;
 } __packed;
 
+struct net_icmpv6_nd_opt_route {
+	u8_t prefix_len;
+	u8_t flags;
+	u32_t route_lifetime;
+	struct in6_addr prefix;
+} __packed;
+
 struct net_icmpv6_nd_opt_6co {
 	u8_t context_len;
 	u8_t flag; /*res:3,c:1,cid:4 */

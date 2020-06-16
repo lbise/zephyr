@@ -2663,6 +2663,78 @@ drop:
 
 	return NET_DROP;
 }
+
+#if defined(CONFIG_NET_ROUTING)
+static enum net_verdict handle_rs_input(struct net_pkt *pkt,
+					struct net_ipv6_hdr *ip_hdr,
+					struct net_icmp_hdr *icmp_hdr)
+{
+	NET_PKT_DATA_ACCESS_CONTIGUOUS_DEFINE(rs_access,
+					      struct net_icmpv6_rs_hdr);
+	//NET_PKT_DATA_ACCESS_DEFINE(nd_access, struct net_icmpv6_nd_opt_hdr);
+	u16_t length = net_pkt_get_len(pkt);
+	struct net_icmpv6_rs_hdr *rs_hdr;
+	struct net_nbr *nbr = NULL;
+	struct net_icmpv6_nd_opt_hdr *nd_opt_hdr;
+	struct net_icmpv6_ra_hdr *ra_hdr;
+	struct net_if_ipv6 *ipv6;
+	struct net_if_ipv6_prefix *prefix = NULL;
+	int err;
+
+	rs_hdr = (struct net_icmpv6_rs_hdr *)net_pkt_get_data(pkt, &rs_access);
+	if (!rs_hdr) {
+		NET_ERR("DROP: NULL RS header");
+		goto drop;
+	}
+
+	dbg_addr_recv("Router Solicitation", &ip_hdr->src, &ip_hdr->dst, pkt);
+
+	net_stats_update_ipv6_nd_recv(net_pkt_iface(pkt));
+
+	if (((length < (sizeof(struct net_ipv6_hdr) +
+			sizeof(struct net_icmp_hdr) +
+			sizeof(struct net_icmpv6_rs_hdr) +
+			sizeof(struct net_icmpv6_nd_opt_hdr))) ||
+			ip_hdr->hop_limit != NET_IPV6_ND_HOP_LIMIT ||
+			icmp_hdr->code != 0U)) {
+		goto drop;
+	}
+
+	ipv6 = net_pkt_iface(pkt)->config.ip.ipv6;
+	if (!ipv6) {
+		goto drop;
+	}
+
+	for (int i = 0; i < NET_IF_MAX_IPV6_PREFIX; i++) {
+		if (!ipv6->prefix[i].is_used) {
+			continue;
+		}
+
+		prefix = &ipv6->prefix[i];
+		break;
+	}
+
+	if (!prefix) {
+		NET_DBG("No prefix to advertise");
+		goto drop;
+	}
+
+	err = net_ipv6_send_ra(net_pkt_iface(pkt), NULL, 0, &prefix->prefix,
+			       prefix->len, 0);
+	if (err) {
+		NET_DBG("Cannot send Router Advertisement (%d)", err);
+		goto drop;
+	}
+
+	return NET_OK;
+
+drop:
+	net_stats_update_ipv6_nd_drop(net_pkt_iface(pkt));
+
+	return NET_DROP;
+}
+#endif /* CONFIG_NET_ROUTING */
+
 #endif /* CONFIG_NET_IPV6_ND */
 
 #if defined(CONFIG_NET_IPV6_NBR_CACHE)
@@ -2685,6 +2757,14 @@ static struct net_icmpv6_handler ra_input_handler = {
 	.code = 0,
 	.handler = handle_ra_input,
 };
+
+#if defined(CONFIG_NET_ROUTING)
+static struct net_icmpv6_handler rs_input_handler = {
+	.type = NET_ICMPV6_RS,
+	.code = 0,
+	.handler = handle_rs_input,
+};
+#endif /* CONFIG_NET_ROUTING */
 #endif /* CONFIG_NET_IPV6_ND */
 
 void net_ipv6_nbr_init(void)
@@ -2696,6 +2776,9 @@ void net_ipv6_nbr_init(void)
 #endif
 #if defined(CONFIG_NET_IPV6_ND)
 	net_icmpv6_register_handler(&ra_input_handler);
+#if defined(CONFIG_NET_ROUTING)
+	net_icmpv6_register_handler(&rs_input_handler);
+#endif
 	k_delayed_work_init(&ipv6_nd_reachable_timer,
 			    ipv6_nd_reachable_timeout);
 	k_sem_init(&nbr_lock, 1, UINT_MAX);
